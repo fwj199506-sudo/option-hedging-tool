@@ -10,47 +10,46 @@ import os
 
 class OptionManager:
     def __init__(self):
-        # 【关键修改】自动获取当前脚本所在的绝对目录，适配云端环境
-        self.base_dir = os.path.dirname(os.path.abspath(__file__))
-        self.history_file = os.path.join(self.base_dir, 'contract_history.json')
-        self.ledger_file = os.path.join(self.base_dir, 'real_trading_ledger.csv')
-        
         self.dc = DataCenter()
         self.model = MertonModel()
+        self.history_file = 'contract_history.json'
+        self.ledger_file = 'real_trading_ledger.csv' # 实盘台账文件
 
     # --- 功能 0: 历史合约管理 ---
-   def load_contract_configs(self):
-        """读取历史配置 - 增加多重防御"""
-        # 防御1：检查文件是否存在
+    def save_contract_config(self, config_name, contract_data):
+        """保存合约配置到本地 JSON"""
+        clean_data = {}
+        for k, v in contract_data.items():
+            if isinstance(v, (np.integer, np.int64)): v = int(v)
+            elif isinstance(v, (np.floating, np.float64)): v = float(v)
+            elif isinstance(v, dict): continue
+            else: clean_data[k] = v
+            
+        history = {}
+        if os.path.exists(self.history_file):
+            try:
+                with open(self.history_file, 'r', encoding='utf-8') as f:
+                    history = json.load(f)
+            except: pass
+        
+        history[config_name] = clean_data
+        with open(self.history_file, 'w', encoding='utf-8') as f:
+            json.dump(history, f, ensure_ascii=False, indent=2)
+        print(f"配置 '{config_name}' 已保存。")
+
+    def load_contract_configs(self):
+        """读取历史配置列表"""
         if not os.path.exists(self.history_file):
             return {}
-        
         try:
             with open(self.history_file, 'r', encoding='utf-8') as f:
                 content = f.read().strip()
-                # 防御2：检查文件是否为空
-                if not content:
+                if not content: # 处理文件为空的情况
                     return {}
                 return json.loads(content)
-        except Exception as e:
-            # 防御3：即便解析出错（如JSON格式不对），也返回空，不让程序崩掉
-            print(f"DEBUG: JSON加载失败，原因: {e}")
+        except (json.JSONDecodeError, Exception) as e:
+            print(f"加载配置失败: {e}")
             return {}
-
-    def load_trade_ledger(self):
-        """读取实盘台账 - 增加多重防御"""
-        if not os.path.exists(self.ledger_file):
-            return pd.DataFrame(columns=['日期', '标的', '操作', '成交价', '股数', '手续费', '资金变动', '备注'])
-        
-        try:
-            # 防御：处理可能存在的编码问题
-            df = pd.read_csv(self.ledger_file, encoding='utf-8-sig')
-            if df.empty:
-                raise ValueError("文件内容为空")
-            return df
-        except Exception as e:
-            print(f"DEBUG: CSV加载失败，原因: {e}")
-            return pd.DataFrame(columns=['日期', '标的', '操作', '成交价', '股数', '手续费', '资金变动', '备注'])
 
     # --- 功能 1: 初始定价 ---
     def create_contract(self, ts_code, start_date, duration_months, notional, 
@@ -285,5 +284,3 @@ class OptionManager:
         # 使用 Total P&L 展示即可
         
         return total_pnl, current_holdings, total_cash_balance, df
-
-
