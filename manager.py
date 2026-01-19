@@ -10,6 +10,7 @@ import os
 
 class OptionManager:
     def __init__(self):
+        # 【关键修改】自动获取当前脚本所在的绝对目录，适配云端环境
         self.base_dir = os.path.dirname(os.path.abspath(__file__))
         self.history_file = os.path.join(self.base_dir, 'contract_history.json')
         self.ledger_file = os.path.join(self.base_dir, 'real_trading_ledger.csv')
@@ -18,32 +19,37 @@ class OptionManager:
         self.model = MertonModel()
 
     # --- 功能 0: 历史合约管理 ---
-    def load_contract_configs(self):
-        """读取历史配置列表 - 增加严格的容错"""
+   def load_contract_configs(self):
+        """读取历史配置 - 增加多重防御"""
+        # 防御1：检查文件是否存在
         if not os.path.exists(self.history_file):
             return {}
+        
         try:
             with open(self.history_file, 'r', encoding='utf-8') as f:
                 content = f.read().strip()
-                if not content: # 如果文件是空的
+                # 防御2：检查文件是否为空
+                if not content:
                     return {}
                 return json.loads(content)
         except Exception as e:
-            # 打印错误到日志，但返回空字典让页面不崩溃
-            print(f"读取配置失败: {e}")
+            # 防御3：即便解析出错（如JSON格式不对），也返回空，不让程序崩掉
+            print(f"DEBUG: JSON加载失败，原因: {e}")
             return {}
 
     def load_trade_ledger(self):
-        """读取实盘台账 - 增加严格的容错"""
+        """读取实盘台账 - 增加多重防御"""
         if not os.path.exists(self.ledger_file):
             return pd.DataFrame(columns=['日期', '标的', '操作', '成交价', '股数', '手续费', '资金变动', '备注'])
+        
         try:
-            df = pd.read_csv(self.ledger_file)
+            # 防御：处理可能存在的编码问题
+            df = pd.read_csv(self.ledger_file, encoding='utf-8-sig')
             if df.empty:
-                return pd.DataFrame(columns=['日期', '标的', '操作', '成交价', '股数', '手续费', '资金变动', '备注'])
+                raise ValueError("文件内容为空")
             return df
         except Exception as e:
-            print(f"读取台账失败: {e}")
+            print(f"DEBUG: CSV加载失败，原因: {e}")
             return pd.DataFrame(columns=['日期', '标的', '操作', '成交价', '股数', '手续费', '资金变动', '备注'])
 
     # --- 功能 1: 初始定价 ---
@@ -279,4 +285,5 @@ class OptionManager:
         # 使用 Total P&L 展示即可
         
         return total_pnl, current_holdings, total_cash_balance, df
+
 
