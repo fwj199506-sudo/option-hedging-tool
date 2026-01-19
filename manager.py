@@ -10,41 +10,41 @@ import os
 
 class OptionManager:
     def __init__(self):
+        self.base_dir = os.path.dirname(os.path.abspath(__file__))
+        self.history_file = os.path.join(self.base_dir, 'contract_history.json')
+        self.ledger_file = os.path.join(self.base_dir, 'real_trading_ledger.csv')
+        
         self.dc = DataCenter()
         self.model = MertonModel()
-        self.history_file = 'contract_history.json'
-        self.ledger_file = 'real_trading_ledger.csv' # 实盘台账文件
 
     # --- 功能 0: 历史合约管理 ---
-    def save_contract_config(self, config_name, contract_data):
-        """保存合约配置到本地 JSON"""
-        clean_data = {}
-        for k, v in contract_data.items():
-            if isinstance(v, (np.integer, np.int64)): v = int(v)
-            elif isinstance(v, (np.floating, np.float64)): v = float(v)
-            elif isinstance(v, dict): continue
-            else: clean_data[k] = v
-            
-        history = {}
-        if os.path.exists(self.history_file):
-            try:
-                with open(self.history_file, 'r', encoding='utf-8') as f:
-                    history = json.load(f)
-            except: pass
-        
-        history[config_name] = clean_data
-        with open(self.history_file, 'w', encoding='utf-8') as f:
-            json.dump(history, f, ensure_ascii=False, indent=2)
-        print(f"配置 '{config_name}' 已保存。")
-
     def load_contract_configs(self):
-        """读取历史配置列表"""
+        """读取历史配置列表 - 增加严格的容错"""
         if not os.path.exists(self.history_file):
             return {}
         try:
             with open(self.history_file, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except: return {}
+                content = f.read().strip()
+                if not content: # 如果文件是空的
+                    return {}
+                return json.loads(content)
+        except Exception as e:
+            # 打印错误到日志，但返回空字典让页面不崩溃
+            print(f"读取配置失败: {e}")
+            return {}
+
+    def load_trade_ledger(self):
+        """读取实盘台账 - 增加严格的容错"""
+        if not os.path.exists(self.ledger_file):
+            return pd.DataFrame(columns=['日期', '标的', '操作', '成交价', '股数', '手续费', '资金变动', '备注'])
+        try:
+            df = pd.read_csv(self.ledger_file)
+            if df.empty:
+                return pd.DataFrame(columns=['日期', '标的', '操作', '成交价', '股数', '手续费', '资金变动', '备注'])
+            return df
+        except Exception as e:
+            print(f"读取台账失败: {e}")
+            return pd.DataFrame(columns=['日期', '标的', '操作', '成交价', '股数', '手续费', '资金变动', '备注'])
 
     # --- 功能 1: 初始定价 ---
     def create_contract(self, ts_code, start_date, duration_months, notional, 
@@ -279,3 +279,4 @@ class OptionManager:
         # 使用 Total P&L 展示即可
         
         return total_pnl, current_holdings, total_cash_balance, df
+
