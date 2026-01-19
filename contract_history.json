@@ -1,0 +1,13 @@
+{
+  "688388.SH_1M": {
+    "ts_code": "688388.SH",
+    "start_date": "20260115",
+    "duration_months": 1,
+    "notional": 1000000,
+    "vol_mode": "auto",
+    "manual_vol": 0.2,
+    "vol_lookback": 252,
+    "strike_pct": 1.0,
+    "manual_strike": null
+  }
+}
