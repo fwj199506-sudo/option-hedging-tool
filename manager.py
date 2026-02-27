@@ -18,7 +18,6 @@ class OptionManager:
         self.ledger_file = 'real_trading_ledger.csv' 
 
     def save_contract_config(self, config_name, contract_data):
-        """保存合约配置"""
         clean_data = {}
         for k, v in contract_data.items():
             if isinstance(v, (np.integer, np.int64)): v = int(v)
@@ -31,14 +30,13 @@ class OptionManager:
             try:
                 with open(self.history_file, 'r', encoding='utf-8') as f:
                     history = json.load(f)
-            except Exception: pass
+            except: pass
         
         history[config_name] = clean_data
         with open(self.history_file, 'w', encoding='utf-8') as f:
             json.dump(history, f, ensure_ascii=False, indent=2)
 
     def load_contract_configs(self):
-        """加载配置"""
         if not os.path.exists(self.history_file): return {}
         try:
             with open(self.history_file, 'r', encoding='utf-8') as f:
@@ -48,7 +46,6 @@ class OptionManager:
         except Exception: return {}
 
     def create_contract(self, ts_code, start_date, duration_months, notional, strike_pct=1.0, manual_strike=None, vol_mode='auto', manual_vol=0.20, vol_lookback=252, sim_price=None):
-        """创建合约对象"""
         real_S, auto_vol, r, q = self.dc.get_market_snapshot(ts_code, start_date, vol_lookback)
         S = sim_price if sim_price is not None else real_S
         final_vol = manual_vol if vol_mode == 'manual' else auto_vol
@@ -70,7 +67,6 @@ class OptionManager:
         }
 
     def run_backtest(self, start_date, end_date, contract, bt_vol_mode='dynamic', bt_manual_vol=None):
-        """历史回测逻辑"""
         lookback = contract.get('vol_lookback', 252)
         df_main, df_shibor, df_basic = self.dc.get_batch_market_data(contract['ts_code'], start_date, end_date, lookback)
         
@@ -108,44 +104,34 @@ class OptionManager:
         return pd.DataFrame(path_data)
 
     def generate_intraday_curve(self, contract, df_intraday):
-        """核心模块：修正列名访问逻辑，匹配 DataCenter 的输出"""
+        """核心模块：将分钟级历史价格瞬间倒推重算为 Delta 曲线"""
         if df_intraday is None or df_intraday.empty: return pd.DataFrame()
             
         path_data = []
-        current_vol = contract['manual_vol'] if contract['vol_mode'] == 'manual' else \
-                      self.dc.get_latest_vol(contract['ts_code'], contract.get('vol_lookback', 252))
+        current_vol = contract['manual_vol'] if contract['vol_mode'] == 'manual' else self.dc.get_latest_vol(contract['ts_code'], contract.get('vol_lookback', 252))
         r, q = contract.get('r', 0.025), contract.get('q', 0.01)
         T = self.dc.get_precise_T(contract['expiry'])
         
-        # 自动识别列名：适配 'close'/'day' 或 '标的价格'/'记录时刻'
-        col_price = 'close' if 'close' in df_intraday.columns else '标的价格'
-        col_time = 'day' if 'day' in df_intraday.columns else '记录时刻'
-        
         for _, row in df_intraday.iterrows():
-            S = row[col_price]
+            S = row['标的价格']
             greeks = self.model.calculate_greeks(S, contract['K'], T, r, q, current_vol)
             target_hold = int(contract['shares'] * greeks['delta'])
             
             path_data.append({
-                "记录时刻": row[col_time], 
-                "标的价格": round(S, 3), 
-                "计算波动率": round(current_vol, 4),
-                "权利金率(%)": round((greeks['price']/S)*100, 2), 
-                "Delta": round(greeks['delta'], 4), 
-                "应持股数": target_hold
+                "记录时刻": row['记录时刻'], "标的价格": round(S, 3), "计算波动率": round(current_vol, 4),
+                "权利金率(%)": round((greeks['price']/S)*100, 2), "Delta": round(greeks['delta'], 4), "应持股数": target_hold
             })
         return pd.DataFrame(path_data)
 
-    def run_scenario_analysis(self, contract, base_price, scenarios_pct=[-0.1, -0.05, -0.02, 0, 0.02, 0.05, 0.1]):
-        """情景分析"""
+    def run_scenario_analysis(self, contract, base_price, scenarios_pct=[-0.1, -0.05, 0, 0.05, 0.1]):
         results = []
-        T_now = self.dc.get_precise_T(contract['expiry'])
-        current_greeks = self.model.calculate_greeks(base_price, contract['K'], T_now, contract['r'], contract['q'], contract['init_vol'])
+        current_greeks = self.model.calculate_greeks(base_price, contract['K'], self.dc.get_precise_T(contract['expiry']), contract['r'], contract['q'], contract['init_vol'])
         current_hold = int(contract['shares'] * current_greeks['delta'])
 
         for pct in scenarios_pct:
             sim_S = base_price * (1 + pct)
-            greeks = self.model.calculate_greeks(sim_S, contract['K'], T_now, contract['r'], contract['q'], contract['init_vol'])
+            T = self.dc.get_precise_T(contract['expiry'])
+            greeks = self.model.calculate_greeks(sim_S, contract['K'], T, contract['r'], contract['q'], contract['init_vol'])
             
             new_rate = (greeks['price'] / sim_S) * 100
             target_shares = int(contract['shares'] * greeks['delta'])
@@ -156,21 +142,19 @@ class OptionManager:
         return pd.DataFrame(results)
 
     def load_trade_ledger(self):
-        """加载台账"""
         if os.path.exists(self.ledger_file): return pd.read_csv(self.ledger_file)
         return pd.DataFrame(columns=['日期', '标的', '操作', '成交价', '股数', '手续费', '资金变动', '备注'])
 
     def add_trade_record(self, date_str, ts_code, action, price, shares, fee, comment):
-        """增加交易记录"""
         df = self.load_trade_ledger()
         cash_flow = -(price * shares) - fee if action == '买入' else (price * shares) - fee
+            
         new_row = {'日期': date_str, '标的': ts_code, '操作': action, '成交价': price, '股数': shares, '手续费': fee, '资金变动': round(cash_flow, 2), '备注': comment}
         df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
         df.to_csv(self.ledger_file, index=False, encoding='utf-8-sig')
         return df
 
     def calculate_ledger_pnl(self, current_price):
-        """计算实盘盈亏"""
         df = self.load_trade_ledger()
         if df.empty: return 0, 0, 0, pd.DataFrame()
             
