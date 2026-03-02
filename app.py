@@ -8,29 +8,6 @@ import time
 
 from github import Github
 
-st.subheader("3. GitHub API 权限深度测试")
-
-
-try:
-    # 使用你从 config 导入的 TOKEN
-    from config import GITHUB_TOKEN, GIST_ID
-    g = Github(GITHUB_TOKEN)
-    user = g.get_user()
-    
-    st.write(f"👤 当前 Token 所属用户: **{user.login}**")
-    
-    # 尝试读取一下这个 Gist
-    try:
-        gist = g.get_gist(GIST_ID)
-        st.success(f"✅ 成功连接到 Gist！描述: {gist.description}")
-        st.write(f"文件列表: {list(gist.files.keys())}")
-    except Exception as e_gist:
-        st.error(f"❌ 能连接 GitHub，但无法访问该 Gist ID: {e_gist}")
-        st.info("请检查 GIST_ID 是否正确，以及该 Gist 是否被删除了。")
-
-except Exception as e_api:
-    st.error(f"❌ GitHub 验证失败: {e_api}")
-    st.info("这通常意味着你的 TOKEN 字符串本身有问题（比如多了空格或已失效）。")
     
 
 # 定义全局北京时间时区
@@ -374,6 +351,7 @@ with main_tabs[4]:
             fig_l.update_layout(title="累计资金占用趋势", xaxis_title="交易笔数")
 
             st.plotly_chart(fig_l, use_container_width=True)
+
 
 
 
