@@ -1,0 +1,12 @@
+{
+  "688343.SH_1727": {
+    "ts_code": "688343.SH",
+    "start_date": "20260225",
+    "duration_months": 1,
+    "notional": 1000000,
+    "vol_mode": "auto",
+    "manual_vol": 0.2,
+    "vol_lookback": 20,
+    "manual_strike": 85.0
+  }
+}
