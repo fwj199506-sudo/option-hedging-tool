@@ -6,6 +6,6 @@ plotly
 scipy
 streamlit-autorefresh
 requests
-github
 PyGithub
+
 
