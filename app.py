@@ -6,32 +6,6 @@ from datetime import datetime, timezone, timedelta
 import os
 import time
 
-st.title("🔍 系统环境诊断")
-
-# 1. 检查 Secrets 是否加载
-st.subheader("1. Secrets 检查")
-if not st.secrets:
-    st.error("❌ 未检测到任何 Secrets！请检查 Streamlit Cloud 后台 Settings -> Secrets。")
-else:
-    keys = list(st.secrets.keys())
-    st.write(f"✅ 已加载的 Key: {keys}")
-    
-    # 检查具体的 Key 是否存在 (不打印值，保护安全)
-    has_token = "GITHUB_TOKEN" in st.secrets
-    has_gist = "GIST_ID" in st.secrets
-    st.write(f"GITHUB_TOKEN 是否存在: {'✅' if has_token else '❌'}")
-    st.write(f"GIST_ID 是否存在: {'✅' if has_gist else '❌'}")
-
-# 2. 检查 config.py 导入情况
-st.subheader("2. 模块导入检查")
-try:
-    from config import GITHUB_TOKEN, GIST_ID
-    st.success("✅ config.py 导入成功")
-    if GITHUB_TOKEN == "你的Token" or not GITHUB_TOKEN: # 检查是否还是占位符
-        st.warning("⚠️ GITHUB_TOKEN 似乎是空值或占位符，没有读到真实数据。")
-except Exception as e:
-    st.error(f"❌ 导入失败: {e}")
-
 # 定义全局北京时间时区
 BJ_TZ = timezone(timedelta(hours=8))
 
@@ -373,3 +347,4 @@ with main_tabs[4]:
             fig_l.update_layout(title="累计资金占用趋势", xaxis_title="交易笔数")
 
             st.plotly_chart(fig_l, use_container_width=True)
+
