@@ -46,6 +46,8 @@ def_vals = {
     'strike_mode': 0, 'strike_pct': 1.0, 'man_strike': 14.50
 }
 
+default_strike_mode_index = 0  # 默认按比例
+
 if selected_config != "-- 新建合约 --":
     data = saved_configs[selected_config]
     def_vals['ticker'] = data.get('ts_code', def_vals['ticker'])
@@ -57,7 +59,18 @@ if selected_config != "-- 新建合约 --":
     def_vals['vol_mode'] = 0 if data.get('vol_mode') == 'auto' else 1
     def_vals['lookback'] = data.get('vol_lookback', 252)
     def_vals['man_vol'] = data.get('manual_vol', 0.2) * 100
+    
+    # --- 修复核心逻辑在此处 ---
     def_vals['strike_pct'] = data.get('strike_pct', 1.0)
+    
+    # 判断是否有保存的手动价格
+    if data.get('manual_strike') is not None:
+        def_vals['man_strike'] = data.get('manual_strike')
+        default_strike_mode_index = 1  # 切换 Radio 按钮到 "手动价格"
+    else:
+        def_vals['man_strike'] = 14.50 # 后备默认值
+        default_strike_mode_index = 0  # 保持 Radio 按钮为 "按比例"
+    # --------------------------
 
 st.sidebar.markdown("---")
 st.sidebar.header("📝 当前合约参数")
@@ -77,12 +90,12 @@ else:
     manual_vol = st.sidebar.number_input("手动值 (%)", value=def_vals['man_vol'], step=1.0) / 100.0
 
 st.sidebar.subheader("行权价(K)")
-strike_mode = st.sidebar.radio("方式", ["按比例", "手动价格"], horizontal=True)
+strike_mode = st.sidebar.radio("方式", ["按比例", "手动价格"], horizontal=True, index=default_strike_mode_index)
 if strike_mode == "按比例":
     strike_pct = st.sidebar.slider("比例 (1.0=平值)", 0.8, 1.2, def_vals['strike_pct'], 0.01)
     manual_strike = None
 else:
-    manual_strike = st.sidebar.number_input("绝对价格", value=14.50, step=0.01)
+    manual_strike = st.sidebar.number_input("绝对价格", value=def_vals['man_strike'], step=0.01)
     strike_pct = 1.0
 
 save_name = st.sidebar.text_input("保存配置名称", placeholder="例如: 杉杉股份_1月期")

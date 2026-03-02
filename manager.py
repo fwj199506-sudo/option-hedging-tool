@@ -1,12 +1,15 @@
 # manager.py
 from data_provider import DataCenter
 from model import MertonModel
+from config import GITHUB_TOKEN, GIST_ID
 from datetime import datetime, timedelta, timezone
 import pandas as pd
 import numpy as np
 import time
 import json
 import os
+import requests
+from io import StringIO
 
 BJ_TZ = timezone(timedelta(hours=8))
 
@@ -16,6 +19,48 @@ class OptionManager:
         self.model = MertonModel()
         self.history_file = 'contract_history.json'
         self.ledger_file = 'real_trading_ledger.csv' 
+        self.github_token = GITHUB_TOKEN
+        self.gist_id = GIST_ID
+
+    def _get_gist_headers(self):
+        return {
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {self.github_token}",
+            "X-GitHub-Api-Version": "2022-11-28"
+        }
+
+    def _load_from_gist(self, filename):
+        """核心组件：从 GitHub Gist 拉取云端数据"""
+        if self.github_token and self.gist_id:
+            try:
+                url = f"https://api.github.com/gists/{self.gist_id}"
+                response = requests.get(url, headers=self._get_gist_headers(), timeout=10)
+                if response.status_code == 200:
+                    gist_data = response.json()
+                    files = gist_data.get('files', {})
+                    if filename in files:
+                        return files[filename]['content']
+            except Exception as e:
+                print(f"读取云端 Gist 失败: {e}")
+        return None
+
+    def _save_to_gist(self, filename, content_str):
+        """核心组件：将数据保存到 GitHub Gist"""
+        if self.github_token and self.gist_id:
+            headers = self._get_gist_headers()
+            payload = {
+                "description": "Option Pricing System Storage",
+                "files": {
+                    filename: {
+                        "content": content_str
+                    }
+                }
+            }
+            try:
+                url = f"https://api.github.com/gists/{self.gist_id}"
+                requests.patch(url, headers=headers, json=payload, timeout=10)
+            except Exception as e:
+                print(f"同步云端 Gist 失败: {e}")
 
     def save_contract_config(self, config_name, contract_data):
         clean_data = {}
@@ -25,18 +70,27 @@ class OptionManager:
             elif isinstance(v, dict): continue
             else: clean_data[k] = v
             
-        history = {}
-        if os.path.exists(self.history_file):
-            try:
-                with open(self.history_file, 'r', encoding='utf-8') as f:
-                    history = json.load(f)
-            except: pass
-        
+        history = self.load_contract_configs()
         history[config_name] = clean_data
+        
+        content_str = json.dumps(history, ensure_ascii=False, indent=2)
+        
+        # 1. 同步云端 Gist
+        self._save_to_gist(self.history_file, content_str)
+        
+        # 2. 存本地备份
         with open(self.history_file, 'w', encoding='utf-8') as f:
-            json.dump(history, f, ensure_ascii=False, indent=2)
+            f.write(content_str)
 
     def load_contract_configs(self):
+        # 1. 优先尝试从云端 Gist 加载
+        content = self._load_from_gist(self.history_file)
+        if content:
+            try:
+                return json.loads(content)
+            except: pass
+            
+        # 2. 如果云端失败或未配置，回退到本地文件
         if not os.path.exists(self.history_file): return {}
         try:
             with open(self.history_file, 'r', encoding='utf-8') as f:
@@ -142,6 +196,14 @@ class OptionManager:
         return pd.DataFrame(results)
 
     def load_trade_ledger(self):
+        # 1. 优先从 Gist 加载云端台账
+        content = self._load_from_gist(self.ledger_file)
+        if content:
+            try:
+                return pd.read_csv(StringIO(content))
+            except: pass
+            
+        # 2. 回退本地
         if os.path.exists(self.ledger_file): return pd.read_csv(self.ledger_file)
         return pd.DataFrame(columns=['日期', '标的', '操作', '成交价', '股数', '手续费', '资金变动', '备注'])
 
@@ -151,7 +213,16 @@ class OptionManager:
             
         new_row = {'日期': date_str, '标的': ts_code, '操作': action, '成交价': price, '股数': shares, '手续费': fee, '资金变动': round(cash_flow, 2), '备注': comment}
         df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
-        df.to_csv(self.ledger_file, index=False, encoding='utf-8-sig')
+        
+        csv_str = df.to_csv(index=False, encoding='utf-8-sig')
+        
+        # 1. 同步云端 Gist
+        self._save_to_gist(self.ledger_file, csv_str)
+        
+        # 2. 存本地备份
+        with open(self.ledger_file, 'w', encoding='utf-8-sig') as f:
+            f.write(csv_str)
+            
         return df
 
     def calculate_ledger_pnl(self, current_price):
