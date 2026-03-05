@@ -6,10 +6,6 @@ from datetime import datetime, timezone, timedelta
 import os
 import time
 
-from github import Github
-
-    
-
 # 定义全局北京时间时区
 BJ_TZ = timezone(timedelta(hours=8))
 
@@ -351,6 +347,7 @@ with main_tabs[4]:
             fig_l.update_layout(title="累计资金占用趋势", xaxis_title="交易笔数")
 
             st.plotly_chart(fig_l, use_container_width=True)
+
 
 
 
