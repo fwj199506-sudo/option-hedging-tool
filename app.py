@@ -130,7 +130,17 @@ with main_tabs[0]:
         sim_s_val = st.slider("💰 模拟当前股价 (Pre-Trade Simulation)", min_value=base_s*0.8, max_value=base_s*1.2, value=base_s, step=0.01)
         
         if abs(sim_s_val - base_s) > 0.001:
-            disp_contract = mgr.create_contract(ticker, start_date_obj.strftime("%Y%m%d"), duration, notional, strike_pct, manual_strike, vol_mode, manual_vol, vol_lookback, sim_price=sim_s_val)
+            # 仅重新计算 Greeks，不复创合约（避免重复 API 调用）
+            dc_sim = DataCenter()
+            sim_T = dc_sim.get_precise_T(contract['expiry'])
+            sim_greeks = MertonModel.calculate_greeks(
+                sim_s_val, contract['K'], sim_T,
+                contract['r'], contract['q'], contract['init_vol'],
+                option_type='call'
+            )
+            disp_contract = dict(contract)
+            disp_contract['S_init'] = sim_s_val
+            disp_contract['greeks'] = sim_greeks
             is_sim = True
         else:
             disp_contract = contract
@@ -140,17 +150,32 @@ with main_tabs[0]:
     s_curr = disp_contract['S_init']
     rate_val = (g['price'] / s_curr * 100)
     
-    m1, m2, m3, m4, m5 = st.columns(5)
+    m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
     m1.metric("计算基准价", f"¥{s_curr:.2f}", delta="模拟中" if is_sim else None)
     m2.metric("行权价 K", f"¥{disp_contract['K']:.2f}")
     m3.metric("合约股数", f"{int(disp_contract['shares']):,}")
     m4.metric("理论权利金率", f"{rate_val:.2f}%")
     m5.metric("初始 Delta", f"{g['delta']:.4f}")
+    m6.metric("Theta (日)", f"{g.get('theta', 0):.6f}")
+    m7.metric("Vega (1%)", f"¥{g.get('vega', 0):.4f}")
 
     st.markdown("### 📄 定价详情单")
     st.table(pd.DataFrame({
-        "项目": ["标的", "到期日", "波动率", "Delta", "Gamma", "单份期权费", "建议初始对冲"],
-        "数值": [ticker, disp_contract['expiry'], f"{disp_contract['init_vol']:.2%}", f"{g['delta']:.4f}", f"{g['gamma']:.6f}", f"¥{g['price']:.4f}", f"{int(disp_contract['shares'] * g['delta']):,} 股"]
+        "项目": ["标的", "到期日", "波动率", "Delta", "Gamma",
+                 "Theta (每日)", "Vega (每1%Vol)", "Rho (每1%利率)",
+                 "单份期权费", "建议初始对冲"],
+        "数值": [
+            ticker,
+            disp_contract['expiry'],
+            f"{disp_contract['init_vol']:.2%}",
+            f"{g['delta']:.4f}",
+            f"{g['gamma']:.6f}",
+            f"{g['theta']:.6f}" if 'theta' in g else "N/A",
+            f"¥{g['vega']:.6f}" if 'vega' in g else "N/A",
+            f"¥{g['rho']:.6f}" if 'rho' in g else "N/A",
+            f"¥{g['price']:.4f}",
+            f"{int(disp_contract['shares'] * g['delta']):,} 股",
+        ]
     }))
 
 # --- Tab 1: 历史路径复盘 ---
@@ -191,7 +216,7 @@ with main_tabs[2]:
     try:
         S_rt, _ = dc.get_realtime_data(ticker)
         rt_vol = contract['manual_vol'] if contract['vol_mode'] == 'manual' else dc.get_latest_vol(ticker, contract['vol_lookback'])
-        res_rt = MertonModel.calculate_greeks(S_rt, contract['K'], dc.get_precise_T(contract['expiry']), contract['r'], contract['q'], rt_vol)
+        res_rt = MertonModel.calculate_greeks(S_rt, contract['K'], dc.get_precise_T(contract['expiry']), contract['r'], contract['q'], rt_vol, option_type='call')
         target_rt = int(contract['shares'] * res_rt['delta'])
     except:
         S_rt, rt_vol, res_rt, target_rt = contract['S_init'], contract['init_vol'], contract['greeks'], int(contract['shares']*contract['greeks']['delta'])
@@ -255,7 +280,7 @@ with main_tabs[3]:
         if st.button("计算报价"):
             dc = DataCenter()
             T_now = dc.get_precise_T(contract['expiry'])
-            res = MertonModel.calculate_greeks(q_price, contract['K'], T_now, contract['r'], contract['q'], q_vol)
+            res = MertonModel.calculate_greeks(q_price, contract['K'], T_now, contract['r'], contract['q'], q_vol, option_type='call')
             st.success(f"参考费率: {(res['price']/q_price)*100:.2f}%")
             st.write(f"Delta: {res['delta']:.4f} | 单价: {res['price']:.4f}")
             
@@ -284,19 +309,22 @@ with main_tabs[3]:
         st.markdown("##### 📉 目标费率倒推隐含波动率 (IV)")
         target_rate = st.number_input("期望权利金费率 (%)", value=round((contract['greeks']['price']/contract['S_init'])*100, 2), step=0.1)
         if st.button("计算隐含波动率"):
-            def get_implied_vol_bs(target_rate_pct, S, K, T, r, q):
-                target_price = S * (target_rate_pct / 100.0)
-                low, high = 1e-4, 5.0
-                for _ in range(60):
-                    mid = (low + high) / 2
-                    price = MertonModel.calculate_greeks(S, K, T, r, q, mid)['price']
-                    if price > target_price: high = mid
-                    else: low = mid
-                return (low + high) / 2
-            
-            dc = DataCenter()
-            iv = get_implied_vol_bs(target_rate, contract['S_init'], contract['K'], dc.get_precise_T(contract['expiry']), contract['r'], contract['q'])
-            st.success(f"👉 对应隐含波动率为: **{iv*100:.2f}%**")
+            dc_iv = DataCenter()
+            T_iv = dc_iv.get_precise_T(contract['expiry'])
+            target_price_iv = contract['S_init'] * (target_rate / 100.0)
+            try:
+                iv = MertonModel.implied_volatility(
+                    target_price=target_price_iv,
+                    S=contract['S_init'],
+                    K=contract['K'],
+                    T=T_iv,
+                    r=contract['r'],
+                    q=contract['q'],
+                    option_type='call',
+                )
+                st.success(f"👉 对应隐含波动率为: **{iv*100:.2f}%**")
+            except Exception as e:
+                st.error(f"IV 计算失败: {e}")
 
 # --- Tab 4: 实盘盈亏台账 ---
 with main_tabs[4]:

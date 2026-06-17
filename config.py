@@ -2,31 +2,35 @@
 import os
 import tushare as ts
 
-# 1. 基础配置
-TS_TOKEN = 'c7b414cc0540544c00b7485e4fd011d6509229ad846b38e48ed2d401'
-
-# --- GitHub Gist 云端保存配置 (解决云部署数据丢失) ---
-import streamlit as st
-
-# 尝试从 Streamlit Secrets 中读取，如果读取不到（比如在本地），可以设个默认值或从本地环境读
+# 1. 敏感配置 — 优先从 Streamlit Secrets 读取，本地则用环境变量
 try:
+    import streamlit as st
+    TS_TOKEN = st.secrets["TS_TOKEN"]
     GITHUB_TOKEN = st.secrets["GITHUB_TOKEN"]
     GIST_ID = st.secrets["GIST_ID"]
-except Exception:
-    # 这里的代码是为了让你在本地没配置 secrets.toml 时也不至于崩溃
-    # 或者你也可以在这里写你本地的测试 Token (记得不要上传到 GitHub!)
-    GITHUB_TOKEN = "你的本地测试Token" 
-    GIST_ID = "你的本地GistID"
+except (ImportError, Exception):
+    # 非 Streamlit 环境（本地 CLI）：从环境变量读取
+    TS_TOKEN = os.environ.get("TS_TOKEN", "")
+    GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+    GIST_ID = os.environ.get("GIST_ID", "")
 
-# 2. 网络修复 (解决你之前的 Read Timeout 问题)
+# 2. 网络修复 (解决 Read Timeout 问题)
 os.environ['http_proxy'] = ''
 os.environ['https_proxy'] = ''
 
-# 3. 初始化 API
+# 3. 初始化 Tushare API
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api(timeout=60)
 
 # 4. 全局业务常数
-VOL_DECAY = 0.06      # EWMA 衰减因子 (1 - 0.94)
+VOL_DECAY = 0.06      # EWMA 衰减因子 (1 - 0.94 = λ=0.94, RiskMetrics 标准)
 ANNUAL_DAYS = 252     # 年化交易日
 DEFAULT_RF = 0.025    # 默认无风险利率
+
+# 5. 日志基础配置（Streamlit 环境会自行配置日志）
+import logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+)

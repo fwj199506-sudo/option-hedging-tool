@@ -1,58 +1,58 @@
 # main.py
-import os
-import sys
-
-# 1. 自动关联路径
-current_dir = os.path.dirname(os.path.abspath(__file__))
-sys.path.append(current_dir)
-
+"""命令行入口 — 快速验证期权定价与 Greeks 计算。"""
+import logging
 from manager import OptionManager
+
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+)
+logger = logging.getLogger(__name__)
+
 
 def main():
     mgr = OptionManager()
-    ticker = '600884.SH'       
-    notional = 1000000        
-    start_date = '20260109'    
-    
-    print(f"系统启动 | 标的: {ticker} | 设定起始日: {start_date}")
+    ticker = '600884.SH'
+    notional = 1_000_000
+    start_date = '20260109'
 
-    # =====================================================
-    # 模式 A：【初始定价】
-    # 新增演示：手动指定波动率为 25% (0.25)，或者使用自动模式但指定窗口为60天
-    # =====================================================
     contract = mgr.create_contract(
-        ts_code=ticker, 
-        start_date=start_date, 
-        duration_months=1, 
+        ts_code=ticker,
+        start_date=start_date,
+        duration_months=1,
         notional=notional,
-        strike_pct=1.0, 
-        # --- 新增配置 ---
-        vol_mode='auto',      # 'auto' 或 'manual'
-        manual_vol=0.25,      # 如果 mode='manual', 则使用此值
-        vol_lookback=60       # 如果 mode='auto', 使用过去60天计算波动率
+        strike_pct=1.0,
+        vol_mode='auto',
+        vol_lookback=60,
     )
 
-    # =====================================================
-    # 模式 B：【路径回测】
-    # 新增演示：bt_vol_mode='fixed_init' (保持波动率不变)
-    # =====================================================
-    print("\n>>> 正在切换至：历史路径回测模式...")
-    # mgr.run_backtest(
-    #     start_date='20251201', 
-    #     end_date='20260113', 
-    #     contract=contract,
-    #     bt_vol_mode='fixed_init' # 选项: dynamic, fixed_init, manual_fixed
-    # )
+    g = contract['greeks']
 
-    # =====================================================
-    # 模式 C：【日内盯盘】
-    # =====================================================
-    print("\n>>> 正在切换至：实时盯盘模式 (Ctrl+C 停止)...")
-    mgr.run_intraday_monitor(
-        contract=contract, 
-        actual_holdings=38000, 
-        interval_minutes=1
-    )
+    print("=" * 60)
+    print(f"  期权定价结果 — Merton 模型 (BS with dividends)")
+    print("=" * 60)
+    print(f"  标的代码      : {ticker}")
+    print(f"  合约起始      : {contract['start_date']}")
+    print(f"  合约到期      : {contract['expiry']}")
+    print(f"  名义本金      : ¥{notional:,}")
+    print(f"  行权价 K      : ¥{contract['K']:.2f}")
+    print(f"  合约股数      : {contract['shares']:,}")
+    print(f"  定价基准价    : ¥{contract['S_init']:.2f}")
+    print(f"  波动率 (年化) : {contract['init_vol']:.2%}")
+    print("-" * 60)
+    print(f"  Price (单价)  : ¥{g['price']:.4f}")
+    print(f"  Delta         : {g['delta']:.4f}")
+    print(f"  Gamma         : {g['gamma']:.6f}")
+    print(f"  Theta  (每日) : {g['theta']:.6f}")
+    print(f"  Vega   (1%Vol): ¥{g['vega']:.6f}")
+    print(f"  Rho    (1%r)  : ¥{g['rho']:.6f}")
+    print("-" * 60)
+    print(f"  权利金费率    : {(g['price'] / contract['S_init'] * 100):.2f}%")
+    print(f"  建议初始对冲  : {int(contract['shares'] * g['delta']):,} 股")
+    print("=" * 60)
+
 
 if __name__ == "__main__":
     main()
