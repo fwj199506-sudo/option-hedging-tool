@@ -5,6 +5,9 @@ from plotly.subplots import make_subplots
 from datetime import datetime, timezone, timedelta
 import os
 import time
+import logging
+
+logger = logging.getLogger(__name__)
 
 # 定义全局北京时间时区
 BJ_TZ = timezone(timedelta(hours=8))
@@ -19,12 +22,16 @@ except ImportError:
 from manager import OptionManager
 from model import MertonModel
 from data_provider import DataCenter
+from config import pro as _ts_pro
 
 st.set_page_config(
     page_title="期权风控与定价系统 Pro",
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# --- 离线/演示模式检测 ---
+OFFLINE_MODE = (_ts_pro is None)
 
 # 使用缓存初始化管理器
 @st.cache_resource
@@ -54,11 +61,13 @@ if selected_config != "-- 新建合约 --":
     def_vals['notional'] = data.get('notional', def_vals['notional'])
     try:
         def_vals['start_date'] = datetime.strptime(data.get('start_date'), "%Y%m%d")
-    except: pass
+    except (ValueError, TypeError) as e:
+        logger.warning(f"解析保存配置的 start_date 失败: {e}，使用默认日期")
     def_vals['duration'] = data.get('duration_months', 1)
     def_vals['vol_mode'] = 0 if data.get('vol_mode') == 'auto' else 1
     def_vals['lookback'] = data.get('vol_lookback', 252)
-    def_vals['man_vol'] = data.get('manual_vol', 0.2) * 100
+    saved_man_vol = data.get('manual_vol')
+    def_vals['man_vol'] = (saved_man_vol * 100) if saved_man_vol is not None else 20.0
     
     # --- 修复核心逻辑在此处 ---
     def_vals['strike_pct'] = data.get('strike_pct', 1.0)
@@ -83,7 +92,7 @@ duration = st.sidebar.slider("合约期限 (月)", 1, 12, def_vals['duration'])
 st.sidebar.subheader("波动率(Sigma)")
 vol_mode_idx = st.sidebar.radio("模式", ["自动计算", "手动设定"], index=def_vals['vol_mode'])
 if vol_mode_idx == "自动计算":
-    vol_mode, manual_vol = 'auto', 0.20
+    vol_mode, manual_vol = 'auto', None  # None 表示后续将从实时计算中获取
     vol_lookback = st.sidebar.slider("回测窗口 (天)", min_value=5, max_value=1000, value=int(def_vals['lookback']), step=1)
 else:
     vol_mode, vol_lookback = 'manual', 252
@@ -100,13 +109,14 @@ else:
 
 save_name = st.sidebar.text_input("保存配置名称", placeholder="例如: 杉杉股份_1月期")
 if st.sidebar.button("💾 保存当前配置"):
-    temp_contract = {
+    # 延迟保存：先创建合约获取准确的 auto vol，再在下面实际保存
+    st.session_state._pending_save = {
+        'save_name': save_name if save_name else f"{ticker}_{datetime.now(BJ_TZ).strftime('%H%M')}",
         'ts_code': ticker, 'start_date': start_date_obj.strftime("%Y%m%d"),
         'duration_months': duration, 'notional': notional,
         'vol_mode': vol_mode, 'manual_vol': manual_vol, 'vol_lookback': vol_lookback,
         'strike_pct': strike_pct, 'manual_strike': manual_strike
     }
-    mgr.save_contract_config(save_name if save_name else f"{ticker}_{datetime.now(BJ_TZ).strftime('%H%M')}", temp_contract)
     st.sidebar.success("已保存!")
     time.sleep(1)
     st.rerun()
@@ -119,7 +129,47 @@ if auto_refresh:
 st.title("📊 期权风控与对冲决策系统 Pro")
 main_tabs = st.tabs(["💎 初始定价", "📈 历史复盘 (P&L)", "⏱️ 日内复盘(免挂机)", "🛠️ 报价与反推测试", "💰 实盘盈亏台账"])
 
-contract = mgr.create_contract(ticker, start_date_obj.strftime("%Y%m%d"), duration, notional, strike_pct, manual_strike, vol_mode, manual_vol, vol_lookback)
+if OFFLINE_MODE:
+    st.warning("⚠️ **离线模式** — 未检测到 Tushare API 令牌。定价与回测功能将使用模拟数据。配置 TS_TOKEN 环境变量或 Streamlit Secrets 以启用实时行情。")
+
+    # 构建模拟合约（不调用 API）
+    S_fallback = 15.0
+    K_fallback = S_fallback if manual_strike is None else manual_strike
+    expiry_dt_fallback = start_date_obj + timedelta(days=int(duration * 30))
+    T_fallback = max((expiry_dt_fallback - datetime.now(BJ_TZ)).days / 252.0, 0.01)
+    shares_fallback = int(notional / K_fallback) if K_fallback > 0 else int(notional / S_fallback)
+    greeks_fallback = MertonModel.calculate_greeks(S_fallback, K_fallback, T_fallback, 0.025, 0.01, 0.25)
+
+    contract = {
+        'ts_code': ticker, 'K': K_fallback, 'shares': shares_fallback,
+        'expiry': expiry_dt_fallback.strftime("%Y%m%d"),
+        'start_date': start_date_obj.strftime("%Y%m%d"),
+        'duration_months': duration, 'notional': notional,
+        'strike_pct': strike_pct, 'S_init': S_fallback,
+        'greeks': greeks_fallback, 'r': 0.025, 'q': 0.01,
+        'init_vol': 0.25, 'vol_mode': vol_mode, 'vol_lookback': vol_lookback,
+        'manual_vol': manual_vol if manual_vol else 0.20,
+    }
+else:
+    try:
+        contract = mgr.create_contract(ticker, start_date_obj.strftime("%Y%m%d"), duration, notional, strike_pct, manual_strike, vol_mode, manual_vol, vol_lookback)
+    except Exception as e:
+        st.error(f"❌ 创建合约失败: {e}")
+        st.info("请检查 TS_TOKEN 是否正确配置，或网络连接是否正常。")
+        st.stop()
+
+# 🔴 修复：延迟保存 — 使用合约的实际 init_vol 作为 manual_vol 备份
+if '_pending_save' in st.session_state:
+    pending = st.session_state.pop('_pending_save')
+    if pending['vol_mode'] == 'auto':
+        pending['manual_vol'] = contract['init_vol']  # 用实际计算值替代 None
+    mgr.save_contract_config(pending['save_name'], pending)
+    st.rerun()
+
+# 检查合约是否创建成功
+if OFFLINE_MODE and contract['S_init'] <= 0:
+    st.error("离线模式下无法创建合约。请配置 TS_TOKEN 后重试。")
+    st.stop()
 
 # --- Tab 0: 初始定价 ---
 with main_tabs[0]:
@@ -197,11 +247,12 @@ with main_tabs[1]:
             fig_bt.update_layout(title="股价 vs Delta", margin=dict(l=0,r=0,t=30,b=0))
             st.plotly_chart(fig_bt, use_container_width=True)
 
-            st.markdown("#### 💰 对冲端盈亏 (P&L)")
+            st.markdown("#### 💰 对冲端与总盈亏 (P&L)")
             fig_pnl = go.Figure()
-            fig_pnl.add_trace(go.Bar(x=df_bt['日期Str'], y=df_bt['当日盈亏'], name="当日盈亏"))
-            fig_pnl.add_trace(go.Scatter(x=df_bt['日期Str'], y=df_bt['累计盈亏'], name="累计盈亏", yaxis="y2", line=dict(color='red', width=3)))
-            fig_pnl.update_layout(yaxis2=dict(overlaying='y', side='right'), title="股票对冲端盈亏记录", xaxis=dict(type='category'))
+            fig_pnl.add_trace(go.Bar(x=df_bt['日期Str'], y=df_bt['对冲端当日盈亏'], name="对冲端当日盈亏"))
+            fig_pnl.add_trace(go.Scatter(x=df_bt['日期Str'], y=df_bt['对冲端累计盈亏'], name="对冲端累计", yaxis="y2", line=dict(color='orange', width=2, dash='dot')))
+            fig_pnl.add_trace(go.Scatter(x=df_bt['日期Str'], y=df_bt['总累计盈亏(含权利金)'], name="总累计(含权利金)", yaxis="y2", line=dict(color='red', width=3)))
+            fig_pnl.update_layout(yaxis2=dict(overlaying='y', side='right'), title="对冲盈亏分析 (已含权利金收入 & 融资成本)", xaxis=dict(type='category'))
             st.plotly_chart(fig_pnl, use_container_width=True)
             
             st.dataframe(df_bt.drop(columns=['日期Str']).sort_values("日期", ascending=False), use_container_width=True)
@@ -218,7 +269,8 @@ with main_tabs[2]:
         rt_vol = contract['manual_vol'] if contract['vol_mode'] == 'manual' else dc.get_latest_vol(ticker, contract['vol_lookback'])
         res_rt = MertonModel.calculate_greeks(S_rt, contract['K'], dc.get_precise_T(contract['expiry']), contract['r'], contract['q'], rt_vol, option_type='call')
         target_rt = int(contract['shares'] * res_rt['delta'])
-    except:
+    except Exception:
+        logger.warning("获取实时数据失败，回退到合约初始值", exc_info=True)
         S_rt, rt_vol, res_rt, target_rt = contract['S_init'], contract['init_vol'], contract['greeks'], int(contract['shares']*contract['greeks']['delta'])
     
     ctrl_col1, ctrl_col2 = st.columns([3, 1])
@@ -346,7 +398,7 @@ with main_tabs[4]:
 
     st.markdown("---")
     try: latest_p, _ = DataCenter.get_realtime_data(ticker)
-    except: latest_p = contract['S_init']
+    except Exception: latest_p = contract['S_init']
 
     total_pnl, hold_shares, cash_bal, df_ledger = mgr.calculate_ledger_pnl(latest_p)
 

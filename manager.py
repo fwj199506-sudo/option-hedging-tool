@@ -32,8 +32,9 @@ class OptionManager:
     def __init__(self):
         self.dc = DataCenter()
         self.model = MertonModel  # 类引用（所有方法均为 @staticmethod）
-        self.history_file = 'contract_history.json'
-        self.ledger_file = 'real_trading_ledger.csv'
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        self.history_file = os.path.join(base_dir, 'contract_history.json')
+        self.ledger_file = os.path.join(base_dir, 'real_trading_ledger.csv')
         self.github_token = GITHUB_TOKEN
         self.gist_id = GIST_ID
 
@@ -62,6 +63,11 @@ class OptionManager:
                 files = gist_data.get('files', {})
                 if filename in files:
                     return files[filename]['content']
+            else:
+                logger.warning(
+                    f"读取云端 Gist 返回 HTTP {response.status_code}: "
+                    f"{response.text[:200]}"
+                )
         except Exception as e:
             logger.warning(f"读取云端 Gist 失败: {e}")
         return None
@@ -77,9 +83,16 @@ class OptionManager:
         }
         try:
             url = f"https://api.github.com/gists/{self.gist_id}"
-            requests.patch(url, headers=headers, json=payload, timeout=10)
+            response = requests.patch(url, headers=headers, json=payload, timeout=10)
+            if response.status_code not in (200, 201, 204):
+                logger.error(
+                    f"同步云端 Gist 失败 — HTTP {response.status_code}: "
+                    f"{response.text[:300]}。数据仅保存在本地。"
+                )
+            else:
+                logger.debug(f"已同步 {filename} 到云端 Gist")
         except Exception as e:
-            logger.warning(f"同步云端 Gist 失败: {e}")
+            logger.warning(f"同步云端 Gist 网络异常: {e}")
 
     # ============================================================
     # 合约配置持久化
@@ -292,15 +305,31 @@ class OptionManager:
         # r 和 q 取均值（日间变化极小，不影响结果）
         try:
             r_vals = df_shibor['3m'].values.astype(float) / 100.0
-            r = float(np.nanmean(r_vals)) if len(r_vals) > 0 else DEFAULT_RF
+            r_raw = float(np.nanmean(r_vals)) if len(r_vals) > 0 else DEFAULT_RF
+            r = r_raw if not np.isnan(r_raw) else DEFAULT_RF
+            if np.isnan(r_raw):
+                logger.warning("SHIBOR 数据全为 NaN，回退到默认无风险利率")
         except Exception:
             r = DEFAULT_RF
 
         try:
             q_vals = df_basic['dv_ttm'].values.astype(float) / 100.0
-            q = float(np.nanmean(q_vals)) if len(q_vals) > 0 else 0.01
+            q_raw = float(np.nanmean(q_vals)) if len(q_vals) > 0 else 0.01
+            q = q_raw if not np.isnan(q_raw) else 0.01
+            if np.isnan(q_raw):
+                logger.warning("股息率数据全为 NaN，回退到默认值")
         except Exception:
             q = 0.01
+
+        # --- NaN 守卫：波动率数组中的 NaN 回退到合约初始波动率 ---
+        vol_nan_mask = np.isnan(vol_arr)
+        if np.any(vol_nan_mask):
+            logger.warning(
+                f"波动率数组中有 {vol_nan_mask.sum()} 个 NaN，"
+                f"回退到合约初始波动率 {contract['init_vol']:.4f}"
+            )
+            vol_arr = vol_arr.copy()
+            vol_arr[vol_nan_mask] = contract['init_vol']
 
         # --- 向量化 Greeks 计算（一次性） ---
         greeks_all = self.model.calculate_greeks(S_arr, K, T_arr, r, q, vol_arr)
@@ -308,14 +337,25 @@ class OptionManager:
         delta_arr = np.atleast_1d(greeks_all['delta'])
 
         # --- P&L 计算（向量化） ---
-        # 当日盈亏 = 前一日 delta × shares × (S_t - S_{t-1})
+        # 对冲端 P&L：前一日 delta × shares × (S_t - S_{t-1})
         S_shifted = np.roll(S_arr, 1)
-        S_shifted[0] = S_arr[0]  # 第一天无价格变动
+        S_shifted[0] = S_arr[0]
         delta_prev = np.roll(delta_arr, 1)
-        delta_prev[0] = 0.0  # 第一天无持仓
+        delta_prev[0] = 0.0  # 第一天无初始持仓
 
-        daily_pnl = delta_prev * shares * (S_arr - S_shifted)
-        cum_pnl = np.cumsum(daily_pnl)
+        daily_hedge_pnl = delta_prev * shares * (S_arr - S_shifted)
+        cum_hedge_pnl = np.cumsum(daily_hedge_pnl)
+
+        # 期权端 P&L：期权理论价值变动（空头方向：-(price_t - price_0) × shares）
+        option_premium_total = float(price_arr[0]) * shares
+        daily_option_mtm = -(price_arr - price_arr[0]) * shares
+        # 融资成本近似：每日持仓市值 × r / 252
+        daily_financing = delta_arr * shares * S_arr * (r / ANNUAL_DAYS)
+
+        # 总 P&L = 期权权利金 + 期权 MTM + 对冲端 P&L - 融资成本
+        daily_total_pnl = daily_hedge_pnl + (np.diff(np.insert(daily_option_mtm, 0, 0))) - daily_financing
+        daily_total_pnl[0] = option_premium_total  # 首日计入权利金收入
+        cum_total_pnl = np.cumsum(daily_total_pnl)
 
         target_hold = (shares * delta_arr).astype(int)
 
@@ -330,8 +370,10 @@ class OptionManager:
                 '权利金率(%)': round(float(price_arr[i] / S_arr[i]) * 100, 2),
                 'Delta': round(float(delta_arr[i]), 4),
                 '应持股数': int(target_hold[i]),
-                '当日盈亏': round(float(daily_pnl[i]), 2),
-                '累计盈亏': round(float(cum_pnl[i]), 2),
+                '对冲端当日盈亏': round(float(daily_hedge_pnl[i]), 2),
+                '对冲端累计盈亏': round(float(cum_hedge_pnl[i]), 2),
+                '总当日盈亏(含权利金)': round(float(daily_total_pnl[i]), 2),
+                '总累计盈亏(含权利金)': round(float(cum_total_pnl[i]), 2),
             })
 
         return pd.DataFrame(path_data)
@@ -372,19 +414,24 @@ class OptionManager:
         K = contract['K']
         shares = contract['shares']
 
-        path_data = []
-        for _, row in df_intraday.iterrows():
-            S = float(row['标的价格'])
-            greeks = self.model.calculate_greeks(S, K, T, r, q, current_vol)
-            target_hold = int(shares * greeks['delta'])
+        # 🔴 修复：向量化计算 — 一次性传入所有价格，避免逐行 .iterrows()
+        S_arr = df_intraday['标的价格'].values.astype(float)
+        greeks_all = self.model.calculate_greeks(S_arr, K, T, r, q, current_vol)
 
+        price_arr = np.atleast_1d(greeks_all['price'])
+        delta_arr = np.atleast_1d(greeks_all['delta'])
+        target_hold_arr = (shares * delta_arr).astype(int)
+
+        path_data = []
+        for i, (_, row) in enumerate(df_intraday.iterrows()):
+            S_i = float(S_arr[i])
             path_data.append({
                 "记录时刻": row['记录时刻'],
-                "标的价格": round(S, 3),
+                "标的价格": round(S_i, 3),
                 "计算波动率": round(current_vol, 4),
-                "权利金率(%)": round((greeks['price'] / S) * 100, 2),
-                "Delta": round(greeks['delta'], 4),
-                "应持股数": target_hold,
+                "权利金率(%)": round((float(price_arr[i]) / S_i) * 100, 2),
+                "Delta": round(float(delta_arr[i]), 4),
+                "应持股数": int(target_hold_arr[i]),
             })
         return pd.DataFrame(path_data)
 
@@ -448,20 +495,25 @@ class OptionManager:
 
     def load_trade_ledger(self) -> pd.DataFrame:
         """加载交易台账（优先云端 Gist）。"""
+        default_columns = ['日期', '标的', '操作', '成交价', '股数', '手续费', '资金变动', '备注']
+
         # 1. 优先从 Gist 加载云端台账
         content = self._load_from_gist(self.ledger_file)
         if content:
             try:
-                return pd.read_csv(StringIO(content))
+                df = pd.read_csv(StringIO(content), encoding='utf-8-sig')
+                if not df.empty:
+                    return df
             except Exception:
                 logger.warning("云端台账 CSV 解析失败")
 
         # 2. 回退本地
         if os.path.exists(self.ledger_file):
-            return pd.read_csv(self.ledger_file)
-        return pd.DataFrame(
-            columns=['日期', '标的', '操作', '成交价', '股数', '手续费', '资金变动', '备注']
-        )
+            try:
+                return pd.read_csv(self.ledger_file, encoding='utf-8-sig')
+            except Exception:
+                logger.warning("本地台账 CSV 解析失败")
+        return pd.DataFrame(columns=default_columns)
 
     def add_trade_record(
         self,

@@ -11,11 +11,21 @@ import tushare as ts
 import pandas as pd
 import numpy as np
 import logging
+import os
 from typing import Tuple, List, Optional
 
 logger = logging.getLogger(__name__)
 
 BJ_TZ = timezone(timedelta(hours=8))
+
+
+def _check_pro():
+    """验证 Tushare API 客户端可用性。"""
+    if pro is None:
+        raise RuntimeError(
+            "Tushare API 未初始化 — TS_TOKEN 未设置。"
+            "请在 Streamlit Secrets 或环境变量中配置有效的 TS_TOKEN。"
+        )
 
 
 class DataCenter:
@@ -63,12 +73,18 @@ class DataCenter:
         -------
         (S, vol, r, q) : (float, float, float, float)
         """
+        _check_pro()
         fetch_days = int(vol_lookback * 1.8) + 30
         start_dt = (
             datetime.strptime(date_str, "%Y%m%d") - timedelta(days=fetch_days)
         ).strftime("%Y%m%d")
 
-        df = pro.daily(ts_code=ts_code, start_date=start_dt, end_date=date_str)
+        try:
+            df = pro.daily(ts_code=ts_code, start_date=start_dt, end_date=date_str)
+        except Exception as e:
+            raise RuntimeError(
+                f"Tushare API 调用失败 (pro.daily): {e}。请检查 TS_TOKEN 是否有效。"
+            ) from e
         df = df.sort_values('trade_date')
         if df.empty:
             raise ValueError(f"日期 {date_str} 无法获取到 {ts_code} 的行情数据")
@@ -95,11 +111,17 @@ class DataCenter:
             basic = pro.daily_basic(
                 ts_code=ts_code, trade_date=date_str, fields='dv_ttm'
             )
-            q = (
-                float(basic['dv_ttm'].values[0]) / 100.0
-                if (not basic.empty and basic['dv_ttm'].values[0])
-                else 0.01
-            )
+            # 🔴 修复：dv_ttm=0.0 是合法值（不分红），不能用 truthiness 判断；
+            # NaN 需要显式拦截，防止静默传播。
+            if not basic.empty:
+                raw_val = basic['dv_ttm'].values[0]
+                if raw_val is None or (isinstance(raw_val, float) and np.isnan(raw_val)):
+                    q = 0.01
+                    logger.debug(f"dv_ttm 为 None/NaN，使用默认 q={q}")
+                else:
+                    q = float(raw_val) / 100.0
+            else:
+                q = 0.01
         except Exception:
             logger.warning(f"获取 {date_str} 的利率/股息率失败，使用默认值")
             r, q = DEFAULT_RF, 0.01
@@ -116,13 +138,26 @@ class DataCenter:
         -------
         (T_years, trade_days) : (float, int)
         """
+        _check_pro()
         if eval_date > expiry_date:
             return 0.0, 0
-        cal = pro.trade_cal(
-            exchange='SSE', start_date=eval_date, end_date=expiry_date, is_open='1'
-        )
+        try:
+            cal = pro.trade_cal(
+                exchange='SSE', start_date=eval_date, end_date=expiry_date, is_open='1'
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Tushare API 调用失败 (pro.trade_cal): {e}。请检查 TS_TOKEN 是否有效。"
+            ) from e
+        if cal.empty:
+            logger.warning(f"交易日历为空 ({eval_date}~{expiry_date})，回退到日历日估算")
+            trade_days = max(
+                (datetime.strptime(expiry_date, "%Y%m%d") - datetime.strptime(eval_date, "%Y%m%d")).days
+                * 5 // 7, 0
+            )
+            return trade_days / ANNUAL_DAYS, trade_days
         trade_days = len(cal) - 1
-        return trade_days / ANNUAL_DAYS, trade_days
+        return max(trade_days / ANNUAL_DAYS, 0.0), trade_days
 
     @staticmethod
     def get_batch_market_data(
@@ -134,6 +169,7 @@ class DataCenter:
         -------
         (df_main, df_shibor, df_basic) : 日线行情 + SHIBOR + 基本面
         """
+        _check_pro()
         logger.info(f"正在从 Tushare 下载 {ts_code} 的回测数据 …")
 
         fetch_days = int(vol_lookback * 1.8) + 50
@@ -141,23 +177,40 @@ class DataCenter:
             datetime.strptime(start_date, "%Y%m%d") - timedelta(days=fetch_days)
         ).strftime("%Y%m%d")
 
-        df_daily = pro.daily(ts_code=ts_code, start_date=pre_start, end_date=end_date)
+        try:
+            df_daily = pro.daily(ts_code=ts_code, start_date=pre_start, end_date=end_date)
+        except Exception as e:
+            raise RuntimeError(
+                f"Tushare API 调用失败 (pro.daily 批量): {e}。请检查 TS_TOKEN 是否有效。"
+            ) from e
         df_daily = df_daily.sort_values('trade_date').reset_index(drop=True)
 
-        # EWMA 波动率
-        log_ret = np.log(df_daily['close'] / df_daily['close'].shift(1))
-        df_daily['vol'] = DataCenter._compute_ewma_vol(log_ret, decay=VOL_DECAY)
-        df_daily['vol'] = df_daily['vol'].bfill()
+        # EWMA 波动率 — 使用 dropna() 与 get_market_snapshot 保持一致
+        log_ret = np.log(df_daily['close'] / df_daily['close'].shift(1)).dropna()
+        df_daily['vol'] = np.nan  # 初始化列
+        if len(log_ret) > 0:
+            vol_series = DataCenter._compute_ewma_vol(log_ret, decay=VOL_DECAY)
+            df_daily.loc[1:, 'vol'] = vol_series.values
+        df_daily['vol'] = df_daily['vol'].bfill().replace({np.nan: 0.20})
 
-        df_shibor = pro.shibor(start_date=start_date, end_date=end_date).set_index(
-            'date'
-        )
-        df_basic = pro.daily_basic(
-            ts_code=ts_code,
-            start_date=start_date,
-            end_date=end_date,
-            fields='trade_date,dv_ttm',
-        ).set_index('trade_date')
+        try:
+            df_shibor = pro.shibor(start_date=start_date, end_date=end_date)
+        except Exception:
+            logger.warning("获取 SHIBOR 数据失败，将使用默认无风险利率")
+            df_shibor = pd.DataFrame()
+        df_shibor = df_shibor.set_index('date') if not df_shibor.empty else pd.DataFrame()
+
+        try:
+            df_basic = pro.daily_basic(
+                ts_code=ts_code,
+                start_date=start_date,
+                end_date=end_date,
+                fields='trade_date,dv_ttm',
+            )
+        except Exception:
+            logger.warning("获取基本面数据失败，将使用默认股息率")
+            df_basic = pd.DataFrame()
+        df_basic = df_basic.set_index('trade_date') if not df_basic.empty else pd.DataFrame()
 
         df_main = (
             df_daily[df_daily['trade_date'] >= start_date]
@@ -167,6 +220,12 @@ class DataCenter:
         return df_main, df_shibor, df_basic
 
     @staticmethod
+    def _ts_to_sina_symbol(ts_code: str) -> str:
+        """将 Tushare 代码 (e.g. '600884.SH') 转为新浪财经代码 (e.g. 'sh600884')。"""
+        parts = ts_code.split('.')
+        return parts[1].lower() + parts[0]
+
+    @staticmethod
     def get_realtime_data(ts_code: str) -> Tuple[float, str]:
         """获取实时行情（价格 + 时间）。
 
@@ -174,7 +233,7 @@ class DataCenter:
         -------
         (price, time_str) : (float, str)
         """
-        code = ts_code.split('.')[1].lower() + ts_code.split('.')[0]
+        code = DataCenter._ts_to_sina_symbol(ts_code)
         df = ts.get_realtime_quotes(code)
         if df is None or df.empty:
             raise ValueError(f"无法获取 {ts_code} 的实时行情")
@@ -182,18 +241,37 @@ class DataCenter:
 
     @staticmethod
     def get_precise_T(expiry_date: str) -> float:
-        """计算精确到期时间（年），基于当前北京时间。
+        """计算精确到期时间（年），基于当前北京时间和交易日计数。
+
+        与 get_time_to_expiry 保持约定一致：T = trade_days / ANNUAL_DAYS。
 
         Returns
         -------
-        float : 剩余期限（年），最小 1e-6。
+        float : 剩余期限（年），最小 1e-10。
         """
-        now = datetime.now(BJ_TZ).replace(tzinfo=None)
-        expiry_dt = datetime.strptime(expiry_date, "%Y%m%d").replace(
-            hour=15, minute=0
-        )
-        days_float = (expiry_dt - now).total_seconds() / (24.0 * 3600.0)
-        return max(days_float / 365.0, 1e-6)
+        now = datetime.now(BJ_TZ)
+        eval_date_str = now.strftime("%Y%m%d")
+        expiry_dt = datetime.strptime(expiry_date, "%Y%m%d")
+        # 先做简单日期比较
+        if eval_date_str > expiry_date:
+            return 0.0
+        try:
+            cal = pro.trade_cal(
+                exchange='SSE', start_date=eval_date_str,
+                end_date=expiry_date, is_open='1'
+            )
+            if cal.empty:
+                # 回退：用日历日 / 365 近似
+                now_naive = now.replace(tzinfo=None)
+                days_float = (expiry_dt - now_naive).total_seconds() / (24.0 * 3600.0)
+                return max(days_float / 365.0, 1e-10)
+            trade_days = max(len(cal) - 1, 0)
+            return max(trade_days / ANNUAL_DAYS, 1e-10)
+        except Exception:
+            logger.warning("获取交易日历失败，回退到日历日近似")
+            now_naive = now.replace(tzinfo=None)
+            days_float = (expiry_dt - now_naive).total_seconds() / (24.0 * 3600.0)
+            return max(days_float / 365.0, 1e-10)
 
     @staticmethod
     def get_latest_vol(
@@ -226,7 +304,7 @@ class DataCenter:
         -------
         pd.DataFrame with columns: ['记录时刻', '标的价格']
         """
-        symbol = ts_code.split('.')[1].lower() + ts_code.split('.')[0]
+        symbol = DataCenter._ts_to_sina_symbol(ts_code)
         url = (
             f"http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
             f"CN_MarketData.getKLineData?symbol={symbol}&scale=5&ma=no&datalen=48"
@@ -273,24 +351,48 @@ class DataCenter:
         -------
         np.ndarray : 各日期对应的 T（年），已过期 = 0.0。
         """
-        eval_dates = sorted(set(eval_dates))
-        cal = pro.trade_cal(
-            exchange='SSE',
-            start_date=eval_dates[0],
-            end_date=expiry_date,
-            is_open='1',
-        )
-        trading_list = sorted(cal['cal_date'].tolist())
-        trading_set = set(trading_list)
+        _check_pro()
+        if not eval_dates:
+            return np.array([])
 
-        if expiry_date in trading_set:
-            expiry_idx = trading_list.index(expiry_date)
+        eval_dates = sorted(set(eval_dates))
+
+        try:
+            cal = pro.trade_cal(
+                exchange='SSE',
+                start_date=eval_dates[0],
+                end_date=expiry_date,
+                is_open='1',
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Tushare API 调用失败 (pro.trade_cal 批量): {e}。请检查 TS_TOKEN 是否有效。"
+            ) from e
+
+        if cal.empty:
+            logger.warning(
+                f"交易日历为空 ({eval_dates[0]}~{expiry_date})，回退到日历日近似"
+            )
+            expiry_dt = datetime.strptime(expiry_date, "%Y%m%d")
+            T_arr = np.array([
+                max((expiry_dt - datetime.strptime(d, "%Y%m%d")).days / 365.0, 0.0)
+                for d in eval_dates
+            ])
+            return T_arr
+
+        trading_list = sorted(cal['cal_date'].tolist())
+        # 🔴 修复：用 dict 实现 O(1) 查找，替代 list.index() 的 O(n)
+        date_to_idx = {d: i for i, d in enumerate(trading_list)}
+
+        # 到期日在交易日历中的索引
+        if expiry_date in date_to_idx:
+            expiry_idx = date_to_idx[expiry_date]
         else:
             expiry_idx = len(trading_list)
 
         T_arr = np.array([
-            (expiry_idx - trading_list.index(d)) / ANNUAL_DAYS
-            if (d in trading_set and d <= expiry_date)
+            max(expiry_idx - date_to_idx[d], 0) / ANNUAL_DAYS
+            if (d in date_to_idx and d <= expiry_date)
             else 0.0
             for d in eval_dates
         ])
